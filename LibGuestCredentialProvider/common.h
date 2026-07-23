@@ -42,17 +42,27 @@ void DllRelease();
 enum LIBGUEST_PRINCIPAL_FORMAT
 {
     // LogonDomainName = L"UMD.EDU", UserName = L"libguest42".
-    // Mirrors what `runas /user:libguest42@UMD.EDU` resolves to internally and
-    // never presents a parseable UPN, so there is nothing for CloudAP's
-    // typed-UPN discovery to claim. This is the hypothesis under test.
+    // Empirically REJECTED by the MIT UMD.EDU KDC: on the test device this form
+    // returns 1326 / STATUS_LOGON_FAILURE via both LogonUser and LsaLogonUser.
+    // MIT UMD.EDU is a bare Kerberos realm, not a Windows domain, so there is no
+    // NetBIOS-style "UMD.EDU" domain for LSA to resolve the split form against.
     LGPF_SPLIT_DOMAIN_AND_USER = 0,
 
     // LogonDomainName = L"", UserName = L"libguest42@UMD.EDU".
-    // Fallback shape if the KDC/LSA rejects the split form.
+    // The shape that works: `runas /user:libguest42@UMD.EDU` uses exactly this
+    // (UPN in the username, no separate domain) and gets a genuine
+    // krbtgt/UMD.EDU@UMD.EDU TGT from an MIT KDC (famine.umd.edu). Confirmed on
+    // the AD.UMD.EDU-joined test workstation 2026-07-23.
     LGPF_UPN_IN_USERNAME = 1,
 };
 
-#define LIBGUEST_PRINCIPAL_FORMAT_ACTIVE LGPF_SPLIT_DOMAIN_AND_USER
+// Set to the UPN form after the split form was proven to fail against the MIT
+// KDC (see the enum comments). NOTE: this presents a parseable "@UMD.EDU" UPN,
+// which is precisely what CloudAP's typed-UPN discovery keys on -- so on an
+// Entra-only device this raises the original README question of whether LogonUI
+// routes the credential to us or to Entra first. That is the secure-desktop
+// test, separate from whether LSA accepts the buffer (which this dial fixes).
+#define LIBGUEST_PRINCIPAL_FORMAT_ACTIVE LGPF_UPN_IN_USERNAME
 
 // The only realm this provider will ever authenticate against. Never accept a
 // user-supplied realm (README.md, "Security boundaries").

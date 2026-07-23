@@ -27,3 +27,9 @@ BuildLog.htm
 
 # Local, unsigned build output that should never be committed
 *.dll
+
+# Test-harness scratch. pw.tmp holds a live test credential while the harness
+# runs; harness-output.txt is diagnostic output. Neither belongs in history.
+*.tmp
+pw.tmp
+harness-output.txt

@@ -19,6 +19,15 @@
 //     --registered      CoCreateInstance via the registered CLSID
 //     --logon           Additionally submit the buffer to LsaLogonUser.
 //                       Requires SeTcbPrivilege: run as SYSTEM. TEST VMs ONLY.
+//     --password-file <path>
+//                       Read the password from the first line of <path> instead
+//                       of prompting. REQUIRED when running under PsExec -s:
+//                       PsExec launches the harness through a service and piped
+//                       stdin does not reach the child, so the interactive
+//                       prompt always sees an empty password. A file the child
+//                       opens itself crosses that boundary. Handles UTF-8,
+//                       UTF-8-BOM, and UTF-16LE-BOM files; strips the trailing
+//                       newline. TEST VMs ONLY -- delete the file afterward.
 //     --no-password     Skip the password prompt (serialization will fail
 //                       validation; useful for checking the field plumbing)
 
@@ -165,6 +174,77 @@ namespace
         return fResult;
     }
 
+    // Reads a password from the first line of a file. This is the only input
+    // method that survives PsExec's SYSTEM hand-off: the child opens the file
+    // itself rather than depending on inherited stdin. Handles the encodings a
+    // tester is likely to produce (plain UTF-8, UTF-8 with BOM, UTF-16LE with
+    // BOM) and strips the trailing newline. The caller zeroes the buffer.
+    bool ReadPasswordFromFile(_In_ PCWSTR pwszPath,
+                              _Out_writes_(cch) PWSTR pwszOut, size_t cch)
+    {
+        pwszOut[0] = L'\0';
+
+        HANDLE hFile = CreateFileW(pwszPath, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE)
+        {
+            Fail("could not open password file (error %lu): %ls", GetLastError(), pwszPath);
+            return false;
+        }
+
+        BYTE rgb[1024] = {};
+        DWORD cbRead = 0;
+        BOOL fRead = ReadFile(hFile, rgb, sizeof(rgb) - sizeof(WCHAR), &cbRead, nullptr);
+        CloseHandle(hFile);
+        if (!fRead)
+        {
+            Fail("could not read password file (error %lu)", GetLastError());
+            return false;
+        }
+
+        if (cbRead >= 2 && rgb[0] == 0xFF && rgb[1] == 0xFE)
+        {
+            // UTF-16LE with BOM: the bytes are already wide characters.
+            size_t cchData = (cbRead - 2) / sizeof(WCHAR);
+            if (cchData > cch - 1) { cchData = cch - 1; }
+            memcpy(pwszOut, rgb + 2, cchData * sizeof(WCHAR));
+            pwszOut[cchData] = L'\0';
+        }
+        else
+        {
+            // UTF-8, with or without a BOM. Plain ASCII is valid UTF-8, so this
+            // path also covers ANSI files that hold only ASCII.
+            const BYTE* pb = rgb;
+            DWORD cb = cbRead;
+            if (cb >= 3 && pb[0] == 0xEF && pb[1] == 0xBB && pb[2] == 0xBF)
+            {
+                pb += 3;
+                cb -= 3;
+            }
+            int cchConv = MultiByteToWideChar(CP_UTF8, 0,
+                                              reinterpret_cast<LPCCH>(pb), static_cast<int>(cb),
+                                              pwszOut, static_cast<int>(cch - 1));
+            pwszOut[(cchConv > 0) ? cchConv : 0] = L'\0';
+        }
+
+        // Keep only the first line; drop any trailing CR/LF.
+        for (size_t i = 0; pwszOut[i] != L'\0'; i++)
+        {
+            if (pwszOut[i] == L'\r' || pwszOut[i] == L'\n')
+            {
+                pwszOut[i] = L'\0';
+                break;
+            }
+        }
+
+        if (pwszOut[0] == L'\0')
+        {
+            Fail("password file was empty: %ls", pwszPath);
+            return false;
+        }
+        return true;
+    }
+
     // Decodes the packed KERB_INTERACTIVE_UNLOCK_LOGON so the domain/username
     // split is visible as ground truth rather than assumed. The password is
     // never printed -- only its length, which is enough to prove it was packed.
@@ -231,6 +311,75 @@ namespace
                 Info("%-16s: \"%ls\" (%u chars) at offset %llu",
                      f.name, sz, static_cast<unsigned>(len / sizeof(WCHAR)),
                      static_cast<unsigned long long>(offset));
+            }
+        }
+    }
+
+    // Diagnostic: authenticate the same credential via LogonUser() using each
+    // candidate principal shape. This is roughly what `runas` does internally,
+    // and it needs no SeTcbPrivilege -- so it isolates "is the credential good"
+    // and "which shape does the KDC accept" from the serialization question,
+    // without SYSTEM or the secure desktop.
+    //
+    // If the split shape fails here but the UPN shape succeeds, the fix is
+    // LIBGUEST_PRINCIPAL_FORMAT_ACTIVE in the provider's common.h.
+    void ProbeLogonUser(_In_ PCWSTR pwszAccount, _In_ PCWSTR pwszPassword)
+    {
+        Section("LogonUser probe (which principal shape does the KDC accept?)");
+
+        WCHAR szUpn[192] = {};
+        StringCchPrintfW(szUpn, ARRAYSIZE(szUpn), L"%s@%s", pwszAccount, L"UMD.EDU");
+
+        struct { PCWSTR user; PCWSTR domain; PCSTR desc; } shapes[] =
+        {
+            { pwszAccount, L"UMD.EDU", "split  : user=\"%ls\" domain=\"UMD.EDU\"  (dial 2 = LGPF_SPLIT_DOMAIN_AND_USER, current)" },
+            { szUpn,       nullptr,    "upn    : user=\"%ls\" domain=NULL        (dial 2 = LGPF_UPN_IN_USERNAME)" },
+        };
+
+        for (const auto& s : shapes)
+        {
+            Info(s.desc, s.user);
+
+            HANDLE hToken = nullptr;
+            BOOL fOk = LogonUserW(s.user, s.domain, pwszPassword,
+                                  LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT,
+                                  &hToken);
+            if (fOk)
+            {
+                Ok("  LogonUser SUCCEEDED");
+
+                BYTE rgbUser[SECURITY_MAX_SID_SIZE + sizeof(TOKEN_USER) + 64] = {};
+                DWORD cbUser = sizeof(rgbUser);
+                if (GetTokenInformation(hToken, TokenUser, rgbUser, cbUser, &cbUser))
+                {
+                    TOKEN_USER* ptu = reinterpret_cast<TOKEN_USER*>(rgbUser);
+                    WCHAR szName[256] = {};
+                    WCHAR szDomain[256] = {};
+                    DWORD cchName = ARRAYSIZE(szName);
+                    DWORD cchDomain = ARRAYSIZE(szDomain);
+                    SID_NAME_USE use;
+                    if (LookupAccountSidW(nullptr, ptu->User.Sid, szName, &cchName,
+                                          szDomain, &cchDomain, &use))
+                    {
+                        Ok("  Token identity: %ls\\%ls", szDomain, szName);
+                    }
+                }
+                CloseHandle(hToken);
+            }
+            else
+            {
+                DWORD dwErr = GetLastError();
+                PCSTR pszMeaning = "";
+                switch (dwErr)
+                {
+                case 1326: pszMeaning = " (ERROR_LOGON_FAILURE - bad user or password)"; break;
+                case 1311: pszMeaning = " (ERROR_NO_LOGON_SERVERS - no KDC reachable)"; break;
+                case 1317: pszMeaning = " (ERROR_NO_SUCH_USER)"; break;
+                case 1385: pszMeaning = " (ERROR_LOGON_TYPE_NOT_GRANTED)"; break;
+                case 1327: pszMeaning = " (ERROR_ACCOUNT_RESTRICTION - e.g. blank password)"; break;
+                default: break;
+                }
+                Info("  LogonUser failed: Win32 %lu%s", dwErr, pszMeaning);
             }
         }
     }
@@ -355,18 +504,22 @@ int wmain(int argc, wchar_t** argv)
 {
     PCWSTR pwszDll = nullptr;
     PCWSTR pwszGuest = nullptr;
+    PCWSTR pwszPasswordFile = nullptr;
     bool fUnlock = false;
     bool fRegistered = false;
     bool fLsaLogon = false;
+    bool fProbe = false;
     bool fNoPassword = false;
 
     for (int i = 1; i < argc; i++)
     {
         if (_wcsicmp(argv[i], L"--dll") == 0 && i + 1 < argc)          { pwszDll = argv[++i]; }
         else if (_wcsicmp(argv[i], L"--guest") == 0 && i + 1 < argc)   { pwszGuest = argv[++i]; }
+        else if (_wcsicmp(argv[i], L"--password-file") == 0 && i + 1 < argc) { pwszPasswordFile = argv[++i]; }
         else if (_wcsicmp(argv[i], L"--unlock") == 0)                  { fUnlock = true; }
         else if (_wcsicmp(argv[i], L"--registered") == 0)              { fRegistered = true; }
         else if (_wcsicmp(argv[i], L"--logon") == 0)                   { fLsaLogon = true; }
+        else if (_wcsicmp(argv[i], L"--probe") == 0)                   { fProbe = true; }
         else if (_wcsicmp(argv[i], L"--no-password") == 0)             { fNoPassword = true; }
         else
         {
@@ -739,10 +892,49 @@ int wmain(int argc, wchar_t** argv)
         }
     }
 
-    if (!fNoPassword)
+    if (fNoPassword)
+    {
+        // leave password empty on purpose
+    }
+    else if (pwszPasswordFile != nullptr)
+    {
+        if (ReadPasswordFromFile(pwszPasswordFile, szPassword, ARRAYSIZE(szPassword)))
+        {
+            Ok("password read from file (%zu chars)", wcslen(szPassword));
+        }
+    }
+    else
     {
         printf("         Password (not echoed): ");
         ReadPasswordNoEcho(szPassword, ARRAYSIZE(szPassword));
+
+        // Running as SYSTEM under PsExec means stdin came from a service
+        // hand-off and is empty no matter what the caller piped in. Say so
+        // plainly rather than letting it look like a rejected credential.
+        if (szPassword[0] == L'\0' && fLsaLogon)
+        {
+            Fail("no password arrived on stdin");
+            Info("Under PsExec -s, stdin does not reach the child process.");
+            Info("Use --password-file <path> instead; the child opens it directly.");
+        }
+    }
+
+    // Probe before serialization, while the password is still in hand.
+    if (fProbe && szPassword[0] != L'\0')
+    {
+        // Normalize whatever was typed into the bare account name.
+        WCHAR szAccount[64] = {};
+        PCWSTR pwz = szGuest;
+        while (*pwz == L' ' || *pwz == L'\t') { pwz++; }
+        if (_wcsnicmp(pwz, L"libguest", 8) == 0) { pwz += 8; }
+        WCHAR szDigits[32] = {};
+        size_t d = 0;
+        while (*pwz >= L'0' && *pwz <= L'9' && d < ARRAYSIZE(szDigits) - 1)
+        {
+            szDigits[d++] = *pwz++;
+        }
+        StringCchPrintfW(szAccount, ARRAYSIZE(szAccount), L"libguest%s", szDigits);
+        ProbeLogonUser(szAccount, szPassword);
     }
 
     pCred->SetStringValue(LGFI_GUESTNUMBER, szGuest);
