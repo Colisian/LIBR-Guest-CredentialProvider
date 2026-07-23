@@ -1,23 +1,22 @@
-// LibGuest Credential Provider - COM DLL entry points (scaffolding only).
+// LibGuest Credential Provider - COM DLL entry points and class factory.
 //
-// Plain C++ COM boilerplate following Microsoft's credential-provider sample
-// pattern (no ATL). No CoClass is implemented or registered yet: Phase 2 (see
-// README.md, "Phase 2 - Diagnostic provider") adds the provider class and its
-// class factory. Until then DllGetClassObject reports no available class and
-// self-registration is intentionally not implemented, so this DLL cannot be
-// accidentally registered as a credential provider while it serves nothing.
+// Plain C++ COM following Microsoft's credential-provider sample pattern (no
+// ATL). LogonUI instantiates CLSID_LibGuestCredentialProvider through
+// DllGetClassObject.
 
-#include "targetver.h"
+#include "common.h"
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <objbase.h>
-#include <initguid.h> // must precede Guid.h so DEFINE_GUID emits definitions
+// This translation unit is the single place the project's GUIDs are *defined*;
+// every other file that includes Guid.h just gets declarations.
+#include <initguid.h>
 #include "Guid.h"
 
-// Module-wide object/lock count. Phase 2's credential provider, credential,
-// and class-factory objects must call DllAddRef/DllRelease in their
-// constructors/destructors so DllCanUnloadNow stays accurate.
+#include "LibGuestProvider.h"
+
+#include <new>
+
+// Module-wide object count. Every provider and credential object bumps this in
+// its constructor and drops it in its destructor so DllCanUnloadNow is honest.
 static LONG g_cRef = 0;
 
 void DllAddRef()
@@ -29,6 +28,80 @@ void DllRelease()
 {
     InterlockedDecrement(&g_cRef);
 }
+
+// ---------------------------------------------------------------------------
+// Class factory
+// ---------------------------------------------------------------------------
+
+class CLibGuestClassFactory : public IClassFactory
+{
+public:
+    CLibGuestClassFactory() : _cRef(1) { DllAddRef(); }
+
+    IFACEMETHODIMP_(ULONG) AddRef()
+    {
+        return InterlockedIncrement(&_cRef);
+    }
+
+    IFACEMETHODIMP_(ULONG) Release()
+    {
+        long cRef = InterlockedDecrement(&_cRef);
+        if (cRef == 0)
+        {
+            delete this;
+        }
+        return static_cast<ULONG>(cRef);
+    }
+
+    IFACEMETHODIMP QueryInterface(_In_ REFIID riid, _COM_Outptr_ void** ppv)
+    {
+        if (ppv == nullptr)
+        {
+            return E_POINTER;
+        }
+        if (riid == IID_IUnknown || riid == IID_IClassFactory)
+        {
+            *ppv = static_cast<IClassFactory*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    IFACEMETHODIMP CreateInstance(_In_opt_ IUnknown* pUnkOuter, _In_ REFIID riid,
+                                  _COM_Outptr_ void** ppv)
+    {
+        *ppv = nullptr;
+        if (pUnkOuter != nullptr)
+        {
+            return CLASS_E_NOAGGREGATION;
+        }
+        return CLibGuestProvider::CreateInstance(riid, ppv);
+    }
+
+    IFACEMETHODIMP LockServer(BOOL fLock)
+    {
+        if (fLock)
+        {
+            DllAddRef();
+        }
+        else
+        {
+            DllRelease();
+        }
+        return S_OK;
+    }
+
+private:
+    ~CLibGuestClassFactory() { DllRelease(); }
+
+    long _cRef;
+};
+
+// ---------------------------------------------------------------------------
+// DLL entry points
+// ---------------------------------------------------------------------------
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID /*lpReserved*/)
 {
@@ -54,7 +127,7 @@ STDAPI DllCanUnloadNow()
 }
 
 _Check_return_
-STDAPI DllGetClassObject(_In_ REFCLSID rclsid, _In_ REFIID /*riid*/, _Outptr_ void** ppv)
+STDAPI DllGetClassObject(_In_ REFCLSID rclsid, _In_ REFIID riid, _Outptr_ void** ppv)
 {
     if (ppv == nullptr)
     {
@@ -62,22 +135,33 @@ STDAPI DllGetClassObject(_In_ REFCLSID rclsid, _In_ REFIID /*riid*/, _Outptr_ vo
     }
     *ppv = nullptr;
 
-    // Phase 2: when rclsid == CLSID_LibGuestCredentialProvider, return the
-    // provider's class factory here.
-    UNREFERENCED_PARAMETER(rclsid);
-    return CLASS_E_CLASSNOTAVAILABLE;
+    if (rclsid != CLSID_LibGuestCredentialProvider)
+    {
+        return CLASS_E_CLASSNOTAVAILABLE;
+    }
+
+    CLibGuestClassFactory* pFactory = new (std::nothrow) CLibGuestClassFactory();
+    if (pFactory == nullptr)
+    {
+        return E_OUTOFMEMORY;
+    }
+
+    HRESULT hr = pFactory->QueryInterface(riid, ppv);
+    pFactory->Release();
+    return hr;
 }
 
 STDAPI DllRegisterServer()
 {
-    // Intentionally not implemented while no CoClass exists. Production
-    // registration is performed by the signed Intune installer script (see
-    // README.md, "Registry registration model"), not by regsvr32.
+    // Intentionally not implemented. Registration is performed by the signed
+    // Intune installer script, explicitly and idempotently, not by regsvr32
+    // (README.md, "Registry registration model").
     return E_NOTIMPL;
 }
 
 STDAPI DllUnregisterServer()
 {
-    // See DllRegisterServer. The uninstaller/kill switch owns removal.
+    // See DllRegisterServer. The uninstaller/kill switch owns removal, and it
+    // must remove the Credential Providers registration before the CLSID.
     return E_NOTIMPL;
 }
